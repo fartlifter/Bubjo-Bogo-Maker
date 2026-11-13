@@ -13,7 +13,6 @@
 </head>
 <body class="max-w-7xl mx-auto p-6">
 
-  <!-- ⚠️ 배포 후 본인의 Cloud Run 서버 주소로 변경하세요 -->
   <script>
     const API_BASE_URL = "https://aicollecter-1001575491343.asia-northeast3.run.app";
   </script>
@@ -56,7 +55,19 @@
     <button onclick="collectArticles()" id="btn-collect" class="w-full bg-[#ff4b4b] hover:bg-red-600 text-white font-bold py-2.5 rounded-lg transition">
       🚀 기사 수집 시작
     </button>
-    <div id="status-msg" class="mt-3 text-sm text-emerald-400 hidden"></div>
+
+    <!-- 실시간 진행 상황 게이지 바 -->
+    <div id="progress-wrap" class="mt-4 hidden">
+      <div class="flex justify-between text-xs text-gray-300 mb-1.5">
+        <span id="progress-msg">🔍 수집 준비 중...</span>
+        <span id="progress-pct" class="font-mono font-bold text-red-400">0%</span>
+      </div>
+      <div class="w-full bg-gray-800 rounded-full h-2.5 overflow-hidden">
+        <div id="progress-bar" class="bg-[#ff4b4b] h-2.5 rounded-full transition-all duration-200" style="width: 0%"></div>
+      </div>
+    </div>
+
+    <div id="status-msg" class="mt-3 text-sm text-emerald-400 font-medium hidden"></div>
   </div>
 
   <!-- 2. 기사 리스트 영역 -->
@@ -140,7 +151,6 @@
       buildRawReport();
     }
 
-    // 초기 시간 세팅 (오전 00:00 ~ 09:00)
     setSlot('오전', 0, 0, 9, 0);
 
     function highlightContent(text, keywords) {
@@ -157,19 +167,27 @@
     async function collectArticles() {
       const btn = document.getElementById('btn-collect');
       const status = document.getElementById('status-msg');
-      const groups = Array.from(document.querySelectorAll('.grp-chk:checked')).map(cb => cb.value);
+      const progWrap = document.getElementById('progress-wrap');
+      const progBar = document.getElementById('progress-bar');
+      const progMsg = document.getElementById('progress-msg');
+      const progPct = document.getElementById('progress-pct');
 
+      const groups = Array.from(document.querySelectorAll('.grp-chk:checked')).map(cb => cb.value);
       if (groups.length === 0) {
         alert("키워드 그룹을 최소 1개 이상 선택해주세요.");
         return;
       }
 
       btn.disabled = true;
-      btn.innerText = "🔍 실시간 기사 수집 및 본문 대조 중... (약 3~8초 소요)";
+      btn.innerText = "⏳ 실시간 기사 수집 진행 중...";
       status.classList.add('hidden');
+      progWrap.classList.remove('hidden');
+      progBar.style.width = '2%';
+      progPct.innerText = '2%';
+      progMsg.innerText = '🔌 서버 연결 및 크롤러 가동 중...';
 
       try {
-        const res = await fetch(`${API_BASE_URL}/api/collect`, {
+        const res = await fetch(`${API_BASE_URL}/api/collect_stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -180,21 +198,47 @@
         });
 
         if (!res.ok) throw new Error(`서버 응답 오류 (${res.status})`);
-        const data = await res.json();
 
-        wireArticles = data.wire || [];
-        naverArticles = data.naver || [];
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
 
-        renderArticles();
-        buildRawReport();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
 
-        status.innerText = `✅ 수집 완료: 통신기사 ${data.counts.wire_total}건 (연합 ${data.counts.yonhap} / 뉴시스 ${data.counts.newsis}) | 단독기사 ${data.counts.naver}건`;
-        status.classList.remove('hidden');
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const msg = JSON.parse(line);
+            if (msg.type === "progress") {
+              progBar.style.width = `${msg.percent}%`;
+              progPct.innerText = `${msg.percent}%`;
+              progMsg.innerText = msg.message;
+            } else if (msg.type === "done") {
+              progBar.style.width = '100%';
+              progPct.innerText = '100%';
+              progMsg.innerText = '✅ 모든 수집 완료!';
+              const data = msg.data;
+              wireArticles = data.wire || [];
+              naverArticles = data.naver || [];
+              renderArticles();
+              buildRawReport();
+              status.innerText = `✅ 수집 완료: 통신기사 ${data.counts.wire_total}건 (연합 ${data.counts.yonhap} / 뉴시스 ${data.counts.newsis}) | 단독기사 ${data.counts.naver}건`;
+              status.classList.remove('hidden');
+            } else if (msg.type === "error") {
+              throw new Error(msg.message);
+            }
+          }
+        }
       } catch (err) {
         alert("수집 중 오류가 발생했습니다: " + err.message);
       } finally {
         btn.disabled = false;
         btn.innerText = "🚀 기사 수집 시작";
+        setTimeout(() => { progWrap.classList.add('hidden'); }, 1500);
       }
     }
 
