@@ -157,7 +157,6 @@
 
     setSlot('오전', 0, 0, 9, 0);
 
-    // 모바일에서 다른 앱으로 갔다가 돌아왔을 때 즉시 상태 동기화
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         if (activeCollectJobId) checkCollectStatus();
@@ -213,6 +212,9 @@
         const { job_id } = await res.json();
         activeCollectJobId = job_id;
 
+        // 무료 요금제(요청 중에만 CPU 할당)에서도 작업이 끝날 때까지 CPU를 깨워두는 롱폴링 호출
+        fetch(`${API_BASE_URL}/api/job_keepalive/${job_id}`).catch(() => {});
+
         if (collectPollTimer) clearInterval(collectPollTimer);
         collectPollTimer = setInterval(checkCollectStatus, 600);
       } catch (err) {
@@ -254,9 +256,7 @@
           alert("수집 중 오류 발생: " + job.error);
           finishCollectUI();
         }
-      } catch (e) {
-        // 모바일 화면 전환 중 발생하는 일시적 네트워크 중단은 무시하고 대기
-      }
+      } catch (e) {}
     }
 
     function finishCollectUI() {
@@ -377,6 +377,8 @@
         if (!res.ok) throw new Error(data.detail || "요약 시작 실패");
         activeSumJobId = data.job_id;
 
+        fetch(`${API_BASE_URL}/api/job_keepalive/${data.job_id}`).catch(() => {});
+
         if (sumPollTimer) clearInterval(sumPollTimer);
         sumPollTimer = setInterval(checkSummarizeStatus, 800);
       } catch (err) {
@@ -409,9 +411,7 @@
           btn.disabled = false;
           btn.innerText = "🤖 선택 기사 Gemini 요약 실행";
         }
-      } catch (e) {
-        // 백그라운드 전환 시 일시 오류 무시
-      }
+      } catch (e) {}
     }
 
     function copyText(textareaId, btnElement) {
