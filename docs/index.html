@@ -11,16 +11,16 @@
     textarea { font-family: "Menlo", "Consolas", monospace; line-height: 1.6; }
   </style>
 </head>
-<body class="max-w-7xl mx-auto p-6">
+<body class="max-w-7xl mx-auto p-4 md:p-6">
 
   <script>
     const API_BASE_URL = "https://aicollecter-1001575491343.asia-northeast3.run.app";
   </script>
 
-  <h1 class="text-2xl font-bold mb-6">📰 법조 단독·통신기사 보고 생성기</h1>
+  <h1 class="text-xl md:text-2xl font-bold mb-5">📰 법조 단독·통신기사 보고 생성기</h1>
 
   <!-- 1. 시간대 및 키워드 설정 패널 -->
-  <div class="bg-[#1a1c24] p-5 rounded-xl border border-gray-800 mb-6">
+  <div class="bg-[#1a1c24] p-4 md:p-5 rounded-xl border border-gray-800 mb-6">
     <h2 class="text-sm font-semibold text-gray-400 mb-3">⏱️ 수집 시간대 및 키워드 선택</h2>
     
     <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
@@ -63,7 +63,7 @@
         <span id="progress-pct" class="font-mono font-bold text-red-400">0%</span>
       </div>
       <div class="w-full bg-gray-800 rounded-full h-2.5 overflow-hidden">
-        <div id="progress-bar" class="bg-[#ff4b4b] h-2.5 rounded-full transition-all duration-200" style="width: 0%"></div>
+        <div id="progress-bar" class="bg-[#ff4b4b] h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
       </div>
     </div>
 
@@ -124,6 +124,10 @@
     let currentSlot = '오전';
     let wireArticles = [];
     let naverArticles = [];
+    let activeCollectJobId = null;
+    let activeSumJobId = null;
+    let collectPollTimer = null;
+    let sumPollTimer = null;
 
     function toLocalISO(dt) {
       const offset = dt.getTimezoneOffset() * 60000;
@@ -153,6 +157,14 @@
 
     setSlot('오전', 0, 0, 9, 0);
 
+    // 모바일에서 다른 앱으로 갔다가 돌아왔을 때 즉시 상태 동기화
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        if (activeCollectJobId) checkCollectStatus();
+        if (activeSumJobId) checkSummarizeStatus();
+      }
+    });
+
     function highlightContent(text, keywords) {
       let safe = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       (keywords || []).forEach(kw => {
@@ -179,15 +191,15 @@
       }
 
       btn.disabled = true;
-      btn.innerText = "⏳ 실시간 기사 수집 진행 중...";
+      btn.innerText = "⏳ 백그라운드 수집 진행 중... (화면 전환 가능)";
       status.classList.add('hidden');
       progWrap.classList.remove('hidden');
       progBar.style.width = '2%';
       progPct.innerText = '2%';
-      progMsg.innerText = '🔌 서버 연결 및 크롤러 가동 중...';
+      progMsg.innerText = '🔌 서버에 수집 작업을 등록하는 중...';
 
       try {
-        const res = await fetch(`${API_BASE_URL}/api/collect_stream`, {
+        const res = await fetch(`${API_BASE_URL}/api/collect_start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -198,48 +210,61 @@
         });
 
         if (!res.ok) throw new Error(`서버 응답 오류 (${res.status})`);
+        const { job_id } = await res.json();
+        activeCollectJobId = job_id;
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            const msg = JSON.parse(line);
-            if (msg.type === "progress") {
-              progBar.style.width = `${msg.percent}%`;
-              progPct.innerText = `${msg.percent}%`;
-              progMsg.innerText = msg.message;
-            } else if (msg.type === "done") {
-              progBar.style.width = '100%';
-              progPct.innerText = '100%';
-              progMsg.innerText = '✅ 모든 수집 완료!';
-              const data = msg.data;
-              wireArticles = data.wire || [];
-              naverArticles = data.naver || [];
-              renderArticles();
-              buildRawReport();
-              status.innerText = `✅ 수집 완료: 통신기사 ${data.counts.wire_total}건 (연합 ${data.counts.yonhap} / 뉴시스 ${data.counts.newsis}) | 단독기사 ${data.counts.naver}건`;
-              status.classList.remove('hidden');
-            } else if (msg.type === "error") {
-              throw new Error(msg.message);
-            }
-          }
-        }
+        if (collectPollTimer) clearInterval(collectPollTimer);
+        collectPollTimer = setInterval(checkCollectStatus, 600);
       } catch (err) {
-        alert("수집 중 오류가 발생했습니다: " + err.message);
-      } finally {
-        btn.disabled = false;
-        btn.innerText = "🚀 기사 수집 시작";
-        setTimeout(() => { progWrap.classList.add('hidden'); }, 1500);
+        alert("수집 시작 실패: " + err.message);
+        finishCollectUI();
       }
+    }
+
+    async function checkCollectStatus() {
+      if (!activeCollectJobId) return;
+      const progBar = document.getElementById('progress-bar');
+      const progMsg = document.getElementById('progress-msg');
+      const progPct = document.getElementById('progress-pct');
+      const status = document.getElementById('status-msg');
+
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/job_status/${activeCollectJobId}`);
+        if (!res.ok) return;
+        const job = await res.json();
+
+        progBar.style.width = `${job.percent || 0}%`;
+        progPct.innerText = `${job.percent || 0}%`;
+        if (job.message) progMsg.innerText = job.message;
+
+        if (job.status === "done") {
+          clearInterval(collectPollTimer);
+          activeCollectJobId = null;
+          const data = job.data;
+          wireArticles = data.wire || [];
+          naverArticles = data.naver || [];
+          renderArticles();
+          buildRawReport();
+          status.innerText = `✅ 수집 완료: 통신기사 ${data.counts.wire_total}건 (연합 ${data.counts.yonhap} / 뉴시스 ${data.counts.newsis}) | 단독기사 ${data.counts.naver}건`;
+          status.classList.remove('hidden');
+          finishCollectUI();
+        } else if (job.status === "error") {
+          clearInterval(collectPollTimer);
+          activeCollectJobId = null;
+          alert("수집 중 오류 발생: " + job.error);
+          finishCollectUI();
+        }
+      } catch (e) {
+        // 모바일 화면 전환 중 발생하는 일시적 네트워크 중단은 무시하고 대기
+      }
+    }
+
+    function finishCollectUI() {
+      const btn = document.getElementById('btn-collect');
+      const progWrap = document.getElementById('progress-wrap');
+      btn.disabled = false;
+      btn.innerText = "🚀 기사 수집 시작";
+      setTimeout(() => { progWrap.classList.add('hidden'); }, 1500);
     }
 
     function renderArticles() {
@@ -340,22 +365,52 @@
       const sumArea = document.getElementById('sum-textarea');
       btn.disabled = true;
       btn.innerText = "⏳ Gemini 요약 중...";
-      sumArea.value = "Gemini가 세계일보 양식에 맞춰 정제 요약 중입니다...";
+      sumArea.value = "Gemini가 세계일보 양식에 맞춰 정제 요약 중입니다... (다른 앱으로 화면을 전환해도 백그라운드에서 계속 진행됩니다)";
 
       try {
-        const res = await fetch(`${API_BASE_URL}/api/summarize`, {
+        const res = await fetch(`${API_BASE_URL}/api/summarize_start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ raw_report_text: rawText })
         });
         const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "요약 실패");
-        sumArea.value = data.summary;
+        if (!res.ok) throw new Error(data.detail || "요약 시작 실패");
+        activeSumJobId = data.job_id;
+
+        if (sumPollTimer) clearInterval(sumPollTimer);
+        sumPollTimer = setInterval(checkSummarizeStatus, 800);
       } catch (err) {
         sumArea.value = "요약 중 오류가 발생했습니다: " + err.message;
-      } finally {
         btn.disabled = false;
         btn.innerText = "🤖 선택 기사 Gemini 요약 실행";
+      }
+    }
+
+    async function checkSummarizeStatus() {
+      if (!activeSumJobId) return;
+      const btn = document.getElementById('btn-summarize');
+      const sumArea = document.getElementById('sum-textarea');
+
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/job_status/${activeSumJobId}`);
+        if (!res.ok) return;
+        const job = await res.json();
+
+        if (job.status === "done") {
+          clearInterval(sumPollTimer);
+          activeSumJobId = null;
+          sumArea.value = job.summary;
+          btn.disabled = false;
+          btn.innerText = "🤖 선택 기사 Gemini 요약 실행";
+        } else if (job.status === "error") {
+          clearInterval(sumPollTimer);
+          activeSumJobId = null;
+          sumArea.value = "요약 중 오류가 발생했습니다: " + job.error;
+          btn.disabled = false;
+          btn.innerText = "🤖 선택 기사 Gemini 요약 실행";
+        }
+      } catch (e) {
+        // 백그라운드 전환 시 일시 오류 무시
       }
     }
 
