@@ -1,8 +1,10 @@
 import html
 import re
+import time as t
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 import httpx
 from bs4 import BeautifulSoup
 
@@ -21,18 +23,13 @@ MEDIA_MAPPING = {
     "newsis": "뉴시스", "yna": "연합", "mt": "머투", "weekly": "주간조선", "www.imaeil": "매일신문",
     "biz.chosun": "조선비즈", "fnnews": "파뉴", "etoday.co": "이투데이", "edaily.co": "이데일리", "tf.co": "더팩트",
     "yonhapnewstv.co": "연뉴TV", "ytn.co": "YTN", "nocutnews.co": "노컷", "asiae.co": "아경", "biz.heraldcorp": "헤경",
-    "www.sisajournal": "시사저널", "www.ohmynews": "오마이", "dailian.co": "데일리안", "ilyo.co": "일요신문", "sisain.co": "시사IN",
-    "lawtimes": "법률신문"
+    "www.sisajournal": "시사저널", "sisajournal.com": "시사저널", "www.ohmynews": "오마이",
+    "dailian.co": "데일리안", "ilyo.co": "일요신문", "sisain.co": "시사IN", "lawtimes": "법률신문"
 }
 
-EXCLUSIVE_PATTERN = re.compile(r"(\[|\(|\【|\<|\xdb|\ⓧ)?\s*단\s*독\s*(\]|\)|\】|\>|\=|\:|\s|$|\])", re.IGNORECASE)
-
-def is_exclusive_title(title_text: str) -> bool:
-    return bool(EXCLUSIVE_PATTERN.search(title_text))
-
-def get_content(client: httpx.Client, url: str, selector: str) -> str:
+def get_content(url: str, selector: str) -> str:
     try:
-        res = client.get(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}, timeout=6.0)
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         if res.status_code != 200:
             return ""
         soup = BeautifulSoup(res.text, "html.parser")
@@ -47,30 +44,22 @@ def fetch_articles_concurrently(article_list, selector, selected_keywords, progr
     if total == 0:
         return results
 
-    limits = httpx.Limits(max_keepalive_connections=35, max_connections=40)
-    with httpx.Client(timeout=6.0, limits=limits) as shared_client:
-        def worker(art):
-            content = get_content(shared_client, art['url'], selector)
-            if not content:
-                return None
-            matched = [kw for kw in selected_keywords if kw in content]
-            if selected_keywords and not matched:
-                return None
-            art['content'] = content
-            art['matched_kw'] = matched
-            return art
-
-        with ThreadPoolExecutor(max_workers=25) as executor:
-            futures = {executor.submit(worker, art): art for art in article_list}
-            for i, future in enumerate(as_completed(futures)):
-                try:
-                    res = future.result()
-                    if res:
-                        results.append(res)
-                except:
-                    pass
-                if progress_callback:
-                    progress_callback((i + 1) / total, f"[{source_name}] 본문 키워드 대조 중... ({i+1}/{total}건)")
+    with ThreadPoolExecutor(max_workers=25) as executor:
+        futures = {executor.submit(get_content, art['url'], selector): art for art in article_list}
+        for i, future in enumerate(as_completed(futures)):
+            art = futures[future]
+            try:
+                content = future.result()
+                if content:
+                    matched = [kw for kw in selected_keywords if kw in content]
+                    if not selected_keywords or matched:
+                        art['content'] = content
+                        art['matched_kw'] = matched
+                        results.append(art)
+            except:
+                pass
+            if progress_callback:
+                progress_callback((i + 1) / total, f"[{source_name}] 본문 키워드 대조 중... ({i+1}/{total}건)")
 
     results.sort(key=lambda x: x["datetime"], reverse=True)
     return results
@@ -84,51 +73,50 @@ def parse_yonhap(start_dt, end_dt, selected_keywords, progress_callback=None):
     if progress_callback:
         progress_callback(0.0, "🔍 [연합뉴스] 기사 목록 탐색 중...")
 
-    with httpx.Client(headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}, timeout=8.0) as client:
-        while True:
-            url = f"https://www.yna.co.kr/society/all/{page}"
+    while True:
+        url = f"https://www.yna.co.kr/society/all/{page}"
+        try:
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            if res.status_code != 200:
+                break
+        except:
+            break
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        items = soup.select("ul.list01 > li[data-cid]")
+        if not items:
+            break
+
+        for item in items:
+            cid = item.get("data-cid")
+            title_tag = item.select_one(".title01")
+            time_tag = item.select_one(".txt-time")
+            if not (cid and title_tag and time_tag):
+                continue
+
             try:
-                res = client.get(url)
-                if res.status_code != 200:
-                    break
+                time_str = time_tag.text.strip()
+                dt = datetime.strptime(f"{start_dt.year}-{time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Seoul"))
             except:
-                break
+                continue
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            items = soup.select("ul.list01 > li[data-cid]")
-            if not items:
-                break
+            if dt < start_dt:
+                past_streak += 1
+                if past_streak >= MAX_PAST_STREAK:
+                    return fetch_articles_concurrently(collected, "div.story-news.article", selected_keywords, progress_callback, "연합뉴스")
+                continue
+            else:
+                past_streak = 0
 
-            for item in items:
-                cid = item.get("data-cid")
-                title_tag = item.select_one(".title01")
-                time_tag = item.select_one(".txt-time")
-                if not (cid and title_tag and time_tag):
-                    continue
+            if start_dt <= dt <= end_dt:
+                collected.append({
+                    "source": "연합뉴스",
+                    "datetime": dt,
+                    "title": title_tag.text.strip(),
+                    "url": f"https://www.yna.co.kr/view/{cid}"
+                })
 
-                try:
-                    time_str = time_tag.text.strip()
-                    dt = datetime.strptime(f"{start_dt.year}-{time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Seoul"))
-                except:
-                    continue
-
-                if dt < start_dt:
-                    past_streak += 1
-                    if past_streak >= MAX_PAST_STREAK:
-                        return fetch_articles_concurrently(collected, "div.story-news.article", selected_keywords, progress_callback, "연합뉴스")
-                    continue
-                else:
-                    past_streak = 0
-
-                if start_dt <= dt <= end_dt:
-                    collected.append({
-                        "source": "연합뉴스",
-                        "datetime": dt,
-                        "title": title_tag.text.strip(),
-                        "url": f"https://www.yna.co.kr/view/{cid}"
-                    })
-
-            page += 1
+        page += 1
 
     return fetch_articles_concurrently(collected, "div.story-news.article", selected_keywords, progress_callback, "연합뉴스")
 
@@ -141,52 +129,78 @@ def parse_newsis(start_dt, end_dt, selected_keywords, progress_callback=None):
     if progress_callback:
         progress_callback(0.0, "🔍 [뉴시스] 기사 목록 탐색 중...")
 
-    with httpx.Client(headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}, timeout=8.0) as client:
-        while True:
-            url = f"https://www.newsis.com/society/list/?cid=10200&scid=10201&page={page}"
-            try:
-                res = client.get(url)
-                if res.status_code != 200:
-                    break
-            except:
+    while True:
+        url = f"https://www.newsis.com/society/list/?cid=10200&scid=10201&page={page}"
+        try:
+            res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            if res.status_code != 200:
                 break
+        except:
+            break
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            items = soup.select("ul.articleList2 > li")
-            if not items:
-                break
+        soup = BeautifulSoup(res.text, "html.parser")
+        items = soup.select("ul.articleList2 > li")
+        if not items:
+            break
 
-            for item in items:
-                title_tag = item.select_one("p.tit > a")
-                time_tag = item.select_one("p.time")
-                if not (title_tag and time_tag):
-                    continue
+        for item in items:
+            title_tag = item.select_one("p.tit > a")
+            time_tag = item.select_one("p.time")
+            if not (title_tag and time_tag):
+                continue
 
-                match = re.search(r"\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}", time_tag.text)
-                if not match:
-                    continue
+            match = re.search(r"\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}", time_tag.text)
+            if not match:
+                continue
 
-                dt = datetime.strptime(match.group(), "%Y.%m.%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            dt = datetime.strptime(match.group(), "%Y.%m.%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
 
-                if dt < start_dt:
-                    past_streak += 1
-                    if past_streak >= MAX_PAST_STREAK:
-                        return fetch_articles_concurrently(collected, "div.viewer", selected_keywords, progress_callback, "뉴시스")
-                    continue
-                else:
-                    past_streak = 0
+            if dt < start_dt:
+                past_streak += 1
+                if past_streak >= MAX_PAST_STREAK:
+                    return fetch_articles_concurrently(collected, "div.viewer", selected_keywords, progress_callback, "뉴시스")
+                continue
+            else:
+                past_streak = 0
 
-                if start_dt <= dt <= end_dt:
-                    collected.append({
-                        "source": "뉴시스",
-                        "datetime": dt,
-                        "title": title_tag.get_text(strip=True),
-                        "url": "https://www.newsis.com" + title_tag.get("href", "")
-                    })
+            if start_dt <= dt <= end_dt:
+                collected.append({
+                    "source": "뉴시스",
+                    "datetime": dt,
+                    "title": title_tag.get_text(strip=True),
+                    "url": "https://www.newsis.com" + title_tag.get("href", "")
+                })
 
-            page += 1
+        page += 1
 
     return fetch_articles_concurrently(collected, "div.viewer", selected_keywords, progress_callback, "뉴시스")
+
+# === 네이버 단독기사: 과거 코드.py의 검증된 로직 100% 이식 ===
+def naver_parse_pubdate(pubdate_str):
+    try:
+        return datetime.strptime(pubdate_str, "%a, %d %b %Y %H:%M:%S %z")
+    except:
+        return None
+
+def naver_extract_title_and_body(url):
+    try:
+        if "n.news.naver.com" not in url and "lawtimes.co.kr" not in url:
+            return None, None
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if res.status_code != 200:
+            return None, None
+        soup = BeautifulSoup(res.text, "html.parser")
+        if "lawtimes.co.kr" in url:
+            title_div = soup.find("h1", class_="heading")
+            content_div = soup.find("article", id="article-view-content-div")
+        else:
+            title_div = soup.find("div", class_="media_end_head_title")
+            content_div = soup.find("div", id="newsct_article")
+        title = title_div.get_text(strip=True) if title_div else None
+        body = content_div.get_text(separator="\n", strip=True) if content_div else None
+        return title, body
+    except:
+        return None, None
 
 def naver_extract_media_name(url):
     try:
@@ -202,114 +216,94 @@ def naver_extract_media_name(url):
     except:
         return "기타"
 
-def naver_extract_title_and_body_fast(client: httpx.Client, url: str):
-    try:
-        res = client.get(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}, timeout=4.5)
-        if res.status_code != 200:
-            return None, None
-        soup = BeautifulSoup(res.text, "html.parser")
-        if "www.lawtimes.co.kr/news" in url:
-            title_tag = soup.find("h1", class_="heading")
-            content_div = soup.find("article", id="article-view-content-div")
-        elif "n.news.naver.com" in url:
-            title_tag = soup.find("div", class_="media_end_head_title")
-            content_div = soup.find("div", id="newsct_article")
-        else:
-            return None, None
-        title = title_tag.get_text(strip=True) if title_tag else None
-        body = content_div.get_text(separator="\n", strip=True) if content_div else None
-        return title, body
-    except:
-        return None, None
+def safe_api_request(url, headers, params, max_retries=3):
+    res = None
+    for _ in range(max_retries):
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=5)
+            if res.status_code == 200:
+                return res
+            t.sleep(0.5)
+        except:
+            t.sleep(0.5)
+    return res
+
+def fetch_and_filter_naver(item_data):
+    item, start_dt, end_dt, selected_keywords = item_data
+    link = item.get("link")
+    if not link or ("n.news.naver.com" not in link and "lawtimes.co.kr" not in link):
+        return None
+
+    # 시간대를 먼저 확인해 불필요한 웹 요청을 줄이되, 시간대 안이면 무조건 원문 제목/본문 확인
+    pub_dt = naver_parse_pubdate(item.get("pubDate"))
+    if not pub_dt or not (start_dt <= pub_dt <= end_dt):
+        return None
+
+    title, body = naver_extract_title_and_body(link)
+    if not title or not body:
+        return None
+
+    # 과거 코드와 동일하게 직관적인 포함 여부로 검사 (따옴표 붙은 제목 누락 원천 차단)
+    if not any(tag in title for tag in ["[단독]", "(단독)", "【단독】", "ⓧ단독", "단독"]):
+        return None
+
+    matched_keywords = []
+    if selected_keywords:
+        matched_keywords = [kw for kw in selected_keywords if kw in body]
+        if not matched_keywords:
+            return None
+
+    media = naver_extract_media_name(item.get("originallink", ""))
+    clean_title = re.sub(r"\[단독\]|\(단독\)|【단독】|ⓧ단독|^단독\s*[:-]?", "", title).strip()
+
+    return {
+        "매체": media,
+        "title": clean_title,
+        "raw_title": title,
+        "datetime": pub_dt,
+        "content": body,
+        "url": link,
+        "matched_kw": matched_keywords
+    }
 
 def parse_naver_exclusive(start_dt, end_dt, selected_keywords, client_id, client_secret, progress_callback=None):
-    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret
+    }
     seen_links = set()
-    candidate_items = []
+    all_articles = []
 
     steps = list(range(1, 1001, 100))
     total_steps = len(steps)
 
-    # 1. API 메타데이터 초고속 스캔 (1~1000건 완주로 시간 역전 누락 원천 차단)
-    with httpx.Client(timeout=4.0) as api_client:
-        for idx, start_index in enumerate(steps):
-            if progress_callback:
-                progress_callback(idx / total_steps, f"🔍 [단독기사] 네이버 API 탐색 중... (후보 {len(candidate_items)}건 발견)")
+    for idx, start_index in enumerate(steps, 1):
+        if progress_callback:
+            progress_callback(idx / total_steps, f"🟡 [단독기사] 수집 중... (현재 {len(all_articles)}건 수집됨)")
 
-            params = {"query": "[단독]", "sort": "date", "display": 100, "start": start_index}
-            try:
-                res = api_client.get("https://openapi.naver.com/v1/search/news.json", headers=headers, params=params)
-                if res.status_code != 200:
-                    break
-                items = res.json().get("items", [])
-                if not items:
-                    break
-            except:
-                break
+        params = {
+            "query": "[단독]",
+            "sort": "date",
+            "display": 100,
+            "start": start_index
+        }
+        res = safe_api_request("https://openapi.naver.com/v1/search/news.json", headers, params)
+        if not res or res.status_code != 200:
+            break
+        items = res.json().get("items", [])
+        if not items:
+            break
 
-            for item in items:
-                link = item.get("link")
-                if not link or link in seen_links:
-                    continue
-
-                pub_date_str = item.get("pubDate")
-                try:
-                    pub_dt = datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z")
-                except:
-                    continue
-
-                # 시간 범위 1차 필터링
-                if not (start_dt <= pub_dt <= end_dt):
-                    continue
-
-                # API 제목 1차 필터링 (불필요한 웹 크롤링 90% 이상 제거)
-                raw_api_title = html.unescape(re.sub(r"<.*?>", "", item.get("title", "")))
-                if not is_exclusive_title(raw_api_title):
-                    continue
-
-                seen_links.add(link)
-                candidate_items.append((item, pub_dt))
-
-    all_articles = []
-    total_candidates = len(candidate_items)
-
-    # 2. 선별된 후보군만 초고속 병렬 본문 확인
-    limits = httpx.Limits(max_keepalive_connections=35, max_connections=40)
-    with httpx.Client(timeout=4.5, limits=limits) as shared_fetch_client:
-        def process_candidate(candidate):
-            item, pub_dt = candidate
-            link = item.get("link")
-            title, body = naver_extract_title_and_body_fast(shared_fetch_client, link)
-
-            if not title or not body:
-                return None
-
-            # 본문 전체 키워드 대조
-            matched_kw = [kw for kw in selected_keywords if kw in body]
-            if selected_keywords and not matched_kw:
-                return None
-
-            media = naver_extract_media_name(item.get("originallink", ""))
-            clean_title = re.sub(r"\[단독\]|\(단독\)|【단독】|ⓧ단독|^단독\s*[:-]?", "", title).strip()
-
-            return {
-                "매체": media,
-                "title": clean_title,
-                "raw_title": title,
-                "datetime": pub_dt,
-                "content": body,
-                "url": link,
-                "matched_kw": matched_kw
-            }
-
-        with ThreadPoolExecutor(max_workers=30) as executor:
-            futures = {executor.submit(process_candidate, c): c for c in candidate_items}
-            for i, future in enumerate(as_completed(futures)):
-                res = future.result()
-                if res:
-                    all_articles.append(res)
-                if progress_callback and total_candidates > 0:
-                    progress_callback((i + 1) / total_candidates, f"📄 [단독기사] 본문 키워드 대조 중... ({i+1}/{total_candidates}건)")
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            futures = [
+                executor.submit(fetch_and_filter_naver, (item, start_dt, end_dt, selected_keywords))
+                for item in items
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                if result and result["url"] not in seen_links:
+                    seen_links.add(result["url"])
+                    all_articles.append(result)
 
     all_articles.sort(key=lambda x: x["datetime"], reverse=True)
     return all_articles
