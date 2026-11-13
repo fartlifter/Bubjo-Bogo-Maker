@@ -27,7 +27,6 @@ NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET", "49E810CBKY")
 raw_keys = os.environ.get("GEMINI_API_KEYS", os.environ.get("GEMINI_API_KEY", ""))
 GEMINI_API_KEYS = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
 
-# 백그라운드 작업 저장소 (모바일 화면 전환 시에도 서버가 결과 보존)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 def cleanup_old_jobs():
@@ -126,6 +125,17 @@ def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     return job
+
+@app.get("/api/job_keepalive/{job_id}")
+def keep_cpu_alive_until_done(job_id: str):
+    """요청 처리 중에만 CPU를 할당하는 무료 모드에서 작업 완료 시까지 CPU를 깨워두는 롱폴링 엔드포인트"""
+    start_wait = time.time()
+    while time.time() - start_wait < 120:
+        job = JOBS.get(job_id)
+        if not job or job["status"] in ("done", "error"):
+            return {"status": job["status"] if job else "not_found"}
+        time.sleep(0.5)
+    return {"status": "timeout"}
 
 @app.post("/api/summarize_start")
 def start_summarize_job(req: SummarizeRequest):
