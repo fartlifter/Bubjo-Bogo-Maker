@@ -27,6 +27,11 @@ MEDIA_MAPPING = {
     "dailian.co": "데일리안", "ilyo.co": "일요신문", "sisain.co": "시사IN", "lawtimes": "법률신문"
 }
 
+def clean_html_text(raw_str: str) -> str:
+    if not raw_str:
+        return ""
+    return html.unescape(re.sub(r"<.*?>", "", raw_str)).strip()
+
 def get_content(url: str, selector: str) -> str:
     try:
         res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
@@ -34,7 +39,18 @@ def get_content(url: str, selector: str) -> str:
             return ""
         soup = BeautifulSoup(res.text, "html.parser")
         content = soup.select_one(selector)
-        return content.get_text(separator="\n", strip=True) if content else ""
+        if not content:
+            return ""
+
+        for junk in content.select(
+            ".writer-zone, .writer-zone01, .byline, .related-zone, .rel-article, "
+            ".comp-box, .img-con, .txt-copyright, .ad-box, figure, script, style"
+        ):
+            junk.decompose()
+
+        text = content.get_text(separator="\n", strip=True)
+        text = re.split(r"\n(?:관련 뉴스|제보는 카카오톡|<저작권자)", text)[0]
+        return text.strip()
     except:
         return ""
 
@@ -51,7 +67,8 @@ def fetch_articles_concurrently(article_list, selector, selected_keywords, progr
             try:
                 content = future.result()
                 if content:
-                    matched = [kw for kw in selected_keywords if kw in content]
+                    full_search_text = f"{art['title']}\n{content}"
+                    matched = [kw for kw in selected_keywords if kw in full_search_text]
                     if not selected_keywords or matched:
                         art['content'] = content
                         art['matched_kw'] = matched
@@ -175,7 +192,6 @@ def parse_newsis(start_dt, end_dt, selected_keywords, progress_callback=None):
 
     return fetch_articles_concurrently(collected, "div.viewer", selected_keywords, progress_callback, "뉴시스")
 
-# === 네이버 단독기사: 과거 코드.py의 검증된 로직 100% 이식 ===
 def naver_parse_pubdate(pubdate_str):
     try:
         return datetime.strptime(pubdate_str, "%a, %d %b %Y %H:%M:%S %z")
@@ -183,21 +199,75 @@ def naver_parse_pubdate(pubdate_str):
         return None
 
 def naver_extract_title_and_body(url):
+    """
+    1) 네이버뉴스 인링크(news.naver.com)면 전용 셀렉터로 추출
+    2) 언론사 자체 링크(법률신문 포함 모든 비CP사 아웃링크)면 범용 언론사 본문 셀렉터 및 <p> 태그로 추출
+    """
     try:
-        if "n.news.naver.com" not in url and "lawtimes.co.kr" not in url:
-            return None, None
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        res = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"},
+            timeout=5
+        )
         if res.status_code != 200:
             return None, None
+
+        if res.encoding and res.encoding.lower() in ("iso-8859-1", "latin1"):
+            res.encoding = res.apparent_encoding
+
         soup = BeautifulSoup(res.text, "html.parser")
-        if "lawtimes.co.kr" in url:
-            title_div = soup.find("h1", class_="heading")
-            content_div = soup.find("article", id="article-view-content-div")
-        else:
-            title_div = soup.find("div", class_="media_end_head_title")
-            content_div = soup.find("div", id="newsct_article")
-        title = title_div.get_text(strip=True) if title_div else None
-        body = content_div.get_text(separator="\n", strip=True) if content_div else None
+
+        # 1. 네이버 뉴스 페이지인 경우
+        if "news.naver.com" in url:
+            title_div = (
+                soup.find("div", class_="media_end_head_title") or
+                soup.find("h2", id="title_area") or
+                soup.find("h3", id="articleTitle")
+            )
+            content_div = (
+                soup.find("div", id="newsct_article") or
+                soup.find("div", id="articeBody") or
+                soup.find("div", id="articleBodyContents")
+            )
+            title = title_div.get_text(strip=True) if title_div else None
+            body = content_div.get_text(separator="\n", strip=True) if content_div else None
+            return title, body
+
+        # 2. 네이버 뉴스가 아닌 언론사 자체 페이지(아웃링크)인 경우
+        og_title = soup.find("meta", property="og:title")
+        title_tag = soup.find("h1", class_="heading") or soup.find("h1") or soup.find("title")
+        title = og_title.get("content", "").strip() if (og_title and og_title.get("content")) else (title_tag.get_text(strip=True) if title_tag else None)
+
+        for junk in soup.select("script, style, nav, header, footer, aside, iframe, figure, .ad, .advertisement, .related, .copyright"):
+            junk.decompose()
+
+        candidates = [
+            "#article-view-content-div",
+            "#articleBody",
+            "#article_body",
+            "#news_body_area",
+            ".article_view",
+            ".article-body",
+            ".article_body",
+            ".view_con",
+            ".news_cnt_detail_wrap",
+            "[itemprop='articleBody']",
+            "article"
+        ]
+        body = None
+        for sel in candidates:
+            node = soup.select_one(sel)
+            if node:
+                txt = node.get_text(separator="\n", strip=True)
+                if len(txt) >= 80:
+                    body = txt
+                    break
+
+        if not body:
+            p_lines = [p.get_text(" ", strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) >= 25]
+            if p_lines:
+                body = "\n".join(p_lines)
+
         return title, body
     except:
         return None, None
@@ -230,39 +300,59 @@ def safe_api_request(url, headers, params, max_retries=3):
 
 def fetch_and_filter_naver(item_data):
     item, start_dt, end_dt, selected_keywords = item_data
-    link = item.get("link")
-    if not link or ("n.news.naver.com" not in link and "lawtimes.co.kr" not in link):
+
+    naver_link = item.get("link", "")
+    orig_link = item.get("originallink", "")
+
+    # 링크 우선순위: 네이버뉴스 페이지(news.naver.com)가 있으면 우선 사용, 없으면 언론사 자체 링크 사용
+    if "news.naver.com" in naver_link:
+        target_url = naver_link
+    else:
+        target_url = orig_link or naver_link
+
+    if not target_url:
         return None
 
-    # 시간대를 먼저 확인해 불필요한 웹 요청을 줄이되, 시간대 안이면 무조건 원문 제목/본문 확인
     pub_dt = naver_parse_pubdate(item.get("pubDate"))
     if not pub_dt or not (start_dt <= pub_dt <= end_dt):
         return None
 
-    title, body = naver_extract_title_and_body(link)
+    api_title = clean_html_text(item.get("title", ""))
+    api_desc = clean_html_text(item.get("description", ""))
+
+    title, body = naver_extract_title_and_body(target_url)
+
+    # 웹 크롤링 실패 또는 차단 시 네이버 API의 제목·요약문(description)으로 자동 폴백
+    if not title:
+        title = api_title
+    if not body:
+        body = api_desc
+
     if not title or not body:
         return None
 
-    # 과거 코드와 동일하게 직관적인 포함 여부로 검사 (따옴표 붙은 제목 누락 원천 차단)
-    if not any(tag in title for tag in ["[단독]", "(단독)", "【단독】", "ⓧ단독", "단독"]):
+    combined_title_check = f"{title} {api_title}"
+    if not any(tag in combined_title_check for tag in ["[단독]", "(단독)", "【단독】", "ⓧ단독", "단독"]):
         return None
 
     matched_keywords = []
     if selected_keywords:
-        matched_keywords = [kw for kw in selected_keywords if kw in body]
+        search_target = f"{title}\n{body}\n{api_desc}"
+        matched_keywords = [kw for kw in selected_keywords if kw in search_target]
         if not matched_keywords:
             return None
 
-    media = naver_extract_media_name(item.get("originallink", ""))
-    clean_title = re.sub(r"\[단독\]|\(단독\)|【단독】|ⓧ단독|^단독\s*[:-]?", "", title).strip()
+    media = naver_extract_media_name(orig_link or target_url)
+    base_title = api_title if api_title else title
+    clean_title = re.sub(r"\[단독\]|\(단독\)|【단독】|ⓧ단독|^단독\s*[:-]?", "", base_title).strip()
 
     return {
         "매체": media,
         "title": clean_title,
-        "raw_title": title,
+        "raw_title": base_title,
         "datetime": pub_dt,
         "content": body,
-        "url": link,
+        "url": target_url,
         "matched_kw": matched_keywords
     }
 
