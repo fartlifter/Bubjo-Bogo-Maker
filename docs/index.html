@@ -235,6 +235,21 @@
 
       try {
         const res = await fetch(`${API_BASE_URL}/api/job_status/${activeCollectJobId}`);
+
+        // 서버 재시작 등으로 작업이 유실(404)되면 무한 대기 중단
+        if (res.status === 404) {
+          clearInterval(collectPollTimer);
+          activeCollectJobId = null;
+          alert("서버 연결이 초기화되었습니다. 다시 '기사 수집 시작'을 눌러주세요.");
+          finishCollectUI();
+          return;
+        }
+        if (!res.ok) return;
+
+        const job = await res.json();
+
+        // ... (이하 기존 코드 동일)
+        
         if (!res.ok) return;
         const job = await res.json();
 
